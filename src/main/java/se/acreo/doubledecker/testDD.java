@@ -105,11 +105,6 @@ public class testDD implements Observer, DDEvents {
         shell.commandLoop();
     }
 
-    /*@Command(description = "Connect to a broker")
-    public void connect(
-
-    }
-*/
     @Command(description = "Get status of the DD connection")
     public String status() {
         if (client == null) {
@@ -198,7 +193,6 @@ public class testDD implements Observer, DDEvents {
         }
         System.out.println("Bye!");
         System.exit(0);
-        return;
     }
 
 

@@ -42,7 +42,6 @@ public class DDMsg {
         this.data = data;
     }
 
-
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;
@@ -50,9 +49,7 @@ public class DDMsg {
 
         DDMsg ddMsg = (DDMsg) o;
 
-        if (!data.equals(ddMsg.data)) return false;
-        return address.equals(ddMsg.address);
-
+        return data.equals(ddMsg.data) && address.equals(ddMsg.address);
     }
 
     @Override
@@ -69,7 +66,6 @@ public class DDMsg {
                 ", data=" + data +
                 '}';
     }
-
 
     public String getAddress() {
         return address;
