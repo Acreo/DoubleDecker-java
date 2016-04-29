@@ -35,6 +35,7 @@ import org.zeromq.ZFrame;
 import org.zeromq.ZMQ;
 import org.zeromq.ZMsg;
 import sun.misc.BASE64Decoder;
+import zmq.ZError;
 
 import java.io.FileReader;
 import java.io.IOException;
@@ -44,24 +45,24 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.*;
 
-public class DDClient extends Thread {
+public class DDClient implements Runnable {
     private CliState cliState = CliState.UNREG;
     private String broker, hash, name;
     private ZContext ctx;
-    private ZMQ.Socket socket = null;
+    private ZMQ.Socket dealer = null;
+    private ZMQ.Socket signal = null;
     private Formatter log;
     private int timeout = 0;
     private Box tenantBox, brokerBox, publicBox;
-    private HeartBeat heartBeatThread;
     private byte[] bcookie;
     private DDEvents callback;
     private byte[] nonce;
     private HashMap<List<String>, Boolean> sublist = new HashMap<>();
+    private long lastAddLCL;
+    private long lastPong;
 
 
     public DDClient(String broker, String name, boolean verbose, DDEvents callback, String keyfile) throws IOException {
-        this.cliState = CliState.UNREG;
-
         this.broker = broker;
         this.callback = callback;
         this.name = name;
@@ -90,9 +91,6 @@ public class DDClient extends Thread {
         this.brokerBox = new Box(ddpubkey, privkey);
         this.publicBox = new Box(publicpubkey, privkey);
 
-        ctx = new ZContext();
-        socket = ctx.createSocket(ZMQ.DEALER);
-        socket.connect(broker);
     }
 
     private void sublistInactivateAll() {
@@ -107,6 +105,7 @@ public class DDClient extends Thread {
     }
 
     public synchronized boolean sendmsg(String target, String message) {
+
         return sendmsg(target, message.getBytes());
     }
 
@@ -161,7 +160,7 @@ public class DDClient extends Thread {
             tosend.add(this.bcookie);
             tosend.add(target);
             tosend.add(ciphertext);
-            tosend.send(socket);
+            tosend.send(dealer);
             return true;
         } else {
             log.format("DD: Couldn't send, not registered!");
@@ -238,8 +237,7 @@ public class DDClient extends Thread {
             tosend.add(topic);
             tosend.add("");
             tosend.add(ciphertext);
-            log.format("DD: Publishing on topic " + topic + " : " + tosend.toString() + "\n");
-            tosend.send(socket);
+            tosend.send(dealer);
             return true;
         } else {
             log.format("DD: Trying to publish while not connected");
@@ -276,7 +274,7 @@ public class DDClient extends Thread {
             tosend.add(this.bcookie);
             tosend.add(topic);
             tosend.add(scopestr);
-            tosend.send(socket);
+            tosend.send(dealer);
             return true;
         } else {
             log.format("DD: Couldn't subscribe, not connected!");
@@ -328,7 +326,7 @@ public class DDClient extends Thread {
             tosend.add(this.bcookie);
             tosend.add(topic);
             tosend.add(scopestr);
-            tosend.send(socket);
+            tosend.send(dealer);
             return true;
         } else {
             log.format("DD: Couldn't unsubscribe, not connected.");
@@ -339,39 +337,87 @@ public class DDClient extends Thread {
 
     @Override
     protected void finalize() throws Throwable {
-        super.finalize();
         log.format("DD: Cleaning up before closing\n");
-        socket.close();
-        ctx.destroy();
     }
 
     @Override
     public void run() {
+        Thread.currentThread().setName("DDClient-1");
+        ctx = new ZContext();
+        dealer = ctx.createSocket(ZMQ.DEALER);
+        dealer.connect(broker);
+        signal = ctx.createSocket(ZMQ.REP);
+        signal.bind("inproc://signal");
+        int counter = 0;
+        setCliState(CliState.UNREG);
         // Wait for new messages, receive them, and process
         while (!Thread.currentThread().isInterrupted()) {
-            ZMQ.Poller items = new ZMQ.Poller(1);
-            items.register(socket, ZMQ.Poller.POLLIN);
+            ZMQ.Poller items = new ZMQ.Poller(2);
+            items.register(dealer, ZMQ.Poller.POLLIN);
+            items.register(signal, ZMQ.Poller.POLLIN);
+            try {
+                if (items.poll(1000) == -1) {
+                    log.format("items.poll() returned -1\n");
+                    break;
+                }  else if (items.pollin(0)) {
+                    processMessage(ZMsg.recvMsg(dealer));
+                } else if (items.pollin(1)) {
+                    // got signal, abort! abort!
+                    Thread.currentThread().interrupt();
 
-            if (items.poll(3000) == -1) {
-                log.format("items.poll() returned -1\n");
-                break;
-            }
-            if (items.pollin(0)) {
-                processMessage(ZMsg.recvMsg(socket));
-            } else if (cliState == CliState.UNREG) {
-                this.socket.setLinger(0);
-                this.socket.close();
-                this.socket = ctx.createSocket(ZMQ.DEALER);
-                this.socket.connect(broker);
-                ZMsg tosend = new ZMsg();
-                tosend.addFirst(CMD.bprotoVersion);
-                tosend.add(CMD.bADDLCL);
-                tosend.add(this.hash);
-                tosend.send(this.socket);
+                }  // Handle sending reconnect if not connected
+                else if (getStatus() == CliState.UNREG && (System.currentTimeMillis() - lastAddLCL) > 3000) {
+                    sendRegistration();
+                }
+                else if (getStatus() == CliState.REGISTERED && (System.currentTimeMillis() - lastPong) > 1000) {
+                    sendHeartbeat();
+                }
+                if (getStatus() == CliState.REGISTERED && (System.currentTimeMillis() - lastPong) > 3000){
+                    log.format("Broker did not respond, trying to reconnect\n");
+                    setCliState(CliState.UNREG);
+                    callback.disconnected(broker);
+                    sublistInactivateAll();
+                }
+
+            } catch (ZError.IOException e){
+                log.format("items.poll() caught exception: "+ e);
+                Thread.currentThread().interrupt();
             }
         }
+        log.format("DD: returning from run()\n");
+        dealer.close();
+        ctx.destroySocket(signal);
+        ctx.destroySocket(dealer);
+        ctx.destroy();
     }
 
+    private void setCliState(CliState newstate){
+        cliState = newstate;
+        if(newstate == CliState.UNREG)
+            sendRegistration();
+        if (newstate == CliState.REGISTERED)
+            sendHeartbeat();
+    }
+    private void sendHeartbeat(){
+        ZMsg tosend = new ZMsg();
+        tosend.addFirst(CMD.bprotoVersion);
+        tosend.add(CMD.bPING);
+        tosend.add(this.bcookie);
+        tosend.send(dealer);
+    }
+    private void sendRegistration(){
+        this.dealer.setLinger(0);
+        this.dealer.close();
+        ctx.destroySocket(dealer);
+        this.dealer = ctx.createSocket(ZMQ.DEALER);
+        this.dealer.connect(broker);
+        ZMsg tosend = new ZMsg();
+        tosend.addFirst(CMD.bprotoVersion);
+        tosend.add(CMD.bADDLCL);
+        tosend.add(this.hash);
+        tosend.send(this.dealer);
+        lastAddLCL = System.currentTimeMillis();
+    }
     private void processMessage(ZMsg msg) {
         if (msg == null) {
             log.format("DD: received null message!\n");
@@ -489,20 +535,18 @@ public class DDClient extends Thread {
             return;
         }
         this.bcookie = cookieFrame.getData().clone();
-        this.cliState = CliState.REGISTERED;
-        log.format("DD: New cookie: " + this.bcookie.toString() + "\n");
-        // Start the heartbeat with the new cookie
-        heartBeatThread = new HeartBeat(this.bcookie);
-        heartBeatThread.start();
+        setCliState(CliState.REGISTERED);
+        log.format("DD: Registered, cookie: " + this.bcookie.toString() + "\n");
         resubscribe();
         this.callback.registered(this.broker);
+        lastPong = System.currentTimeMillis();
     }
 
     private void cmd_cb_data(ZMsg msg) {
         int retval;
         String source = msg.popString();
         ZFrame encrypted = msg.pop();
-        
+
         /* TODO: Special case for public clients with multiple keys
         int enclen = zframe_size(encrypted);
         unsigned char *decrypted =
@@ -537,6 +581,7 @@ public class DDClient extends Thread {
         }
 
         callback.data(source, plaintext);
+        lastPong = System.currentTimeMillis();
     }
 
     private void cmd_cb_error(ZMsg msg) {
@@ -559,10 +604,12 @@ public class DDClient extends Thread {
             default:
                 log.format("DD: Unknown error code " + code + ". Message: " + reason);
         }
+        lastPong = System.currentTimeMillis();
     }
 
     private void cmd_cb_pong(ZMsg msg) {
         //  log.format("DD: cmd_cb_pong called\n");
+        lastPong = System.currentTimeMillis();
     }
 
     private void cmd_cb_chall(ZMsg msg) {
@@ -589,7 +636,7 @@ public class DDClient extends Thread {
         tosend.add(plaintext);
         tosend.add(this.hash);
         tosend.add(this.name);
-        tosend.send(socket);
+        tosend.send(dealer);
     }
 
     private void cmd_cb_pub(ZMsg msg) {
@@ -639,30 +686,31 @@ public class DDClient extends Thread {
         for (List<String> l : sublist.keySet()) {
             log.format("resubscribe(" + l.get(0) + " " + l.get(1) + ")\n");
 
-          /*  ZMsg tosend = new ZMsg();
+            /*  ZMsg tosend = new ZMsg();
             tosend.addFirst(CMD.bprotoVersion);
             tosend.add(CMD.bSUB);
             tosend.add(this.bcookie);
             tosend.add(topic);
             tosend.add(scopestr);
-            tosend.send(socket);
+            tosend.send(dealer);
             */
         }
     }
 
     public synchronized void shutdown() {
-        ZMsg tosend = new ZMsg();
-        tosend.addFirst(CMD.bprotoVersion);
-        tosend.add(CMD.bUNREG);
-        tosend.add(this.bcookie);
-        tosend.add(this.name);
-        tosend.send(socket);
-        log.format("DD: Unregistering..");
-
-        if (this.heartBeatThread != null) {
-            if (this.heartBeatThread.isAlive()) {
-                this.heartBeatThread.interrupt();
-            }
+        ZMQ.Socket sendsig = ctx.createSocket(ZMQ.REQ);
+        sendsig.connect("inproc://signal");
+        sendsig.send("shutdown");
+        sendsig.close();
+        ctx.destroySocket(sendsig);
+        if(cliState == CliState.REGISTERED) {
+            log.format("DD: shutdown - un-registering from broker..\n");
+            ZMsg tosend = new ZMsg();
+            tosend.addFirst(CMD.bprotoVersion);
+            tosend.add(CMD.bUNREG);
+            tosend.add(this.bcookie);
+            tosend.add(this.name);
+            tosend.send(dealer);
         }
     }
 
@@ -680,9 +728,9 @@ public class DDClient extends Thread {
     }
 
     public static class ERROR {
-        protected final static int REGFAIL = 1;
-        protected final static int NODST = 2;
-        protected final static int VERSION = 3;
+        public final static int REGFAIL = 1;
+        public final static int NODST = 2;
+        public final static int VERSION = 3;
     }
 
     private static class CMD {
@@ -713,29 +761,13 @@ public class DDClient extends Thread {
 
         protected final static byte[] bprotoVersion = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(0x0d0d0003).array();
         protected final static byte[] bSEND = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(SEND).array();
-        protected final static byte[] bFORWARD = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(FORWARD).array();
         protected final static byte[] bADDLCL = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(ADDLCL).array();
-        protected final static byte[] bADDDCL = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(ADDDCL).array();
-        protected final static byte[] bADDBR = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(ADDBR).array();
         protected final static byte[] bUNREG = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(UNREG).array();
-        protected final static byte[] bUNREGDCLI = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(UNREGDCLI).array();
-        protected final static byte[] bUNREGBR = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(UNREGBR).array();
-        protected final static byte[] bDATA = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(DATA).array();
-        protected final static byte[] bREGOK = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(REGOK).array();
-        protected final static byte[] bPONG = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(PONG).array();
         protected final static byte[] bPING = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(PING).array();
-        protected final static byte[] bCHALL = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(CHALL).array();
         protected final static byte[] bCHALLOK = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(CHALLOK).array();
         protected final static byte[] bPUB = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(PUB).array();
         protected final static byte[] bSUB = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(SUB).array();
         protected final static byte[] bUNSUB = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(UNSUB).array();
-        protected final static byte[] bSENDPUBLIC = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(SENDPUBLIC).array();
-        protected final static byte[] bPUBPUBLIC = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(PUBPUBLIC).array();
-        protected final static byte[] bSENDPT = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(SENDPT).array();
-        protected final static byte[] bFORWARDPT = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(FORWARDPT).array();
-        protected final static byte[] bDATAPT = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(DATAPT).array();
-        protected final static byte[] bSUBOK = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(SUBOK).array();
-        protected final static byte[] bERROR = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(ERROR).array();
     }
 
     private class MyFieldNamingStrategy implements FieldNamingStrategy {
@@ -751,46 +783,5 @@ public class DDClient extends Thread {
     private class Subscription {
         private String topic, scope;
         private boolean active;
-    }
-
-    private class HeartBeat extends Thread {
-        byte[] bcookie;
-
-        public HeartBeat(byte[] bcookie) {
-            this.bcookie = bcookie;
-        }
-
-        public void setBcookie(byte[] bcookie) {
-            this.bcookie = bcookie;
-        }
-
-        public void run() {
-            timeout = 0;
-            Thread.currentThread().setName("heartbeat-thread");
-
-            while (!Thread.currentThread().isInterrupted()) {
-                timeout += 1;
-                if (timeout <= 3) {
-                    ZMsg tosend = new ZMsg();
-                    tosend.addFirst(CMD.bprotoVersion);
-                    tosend.add(CMD.bPING);
-                    tosend.add(this.bcookie);
-                    tosend.send(socket);
-                    try {
-                        sleep(1500);
-                    } catch (InterruptedException e) {
-                        log.format(e.toString());
-                        this.interrupt();
-                        return;
-                    }
-                } else {
-                    log.format("Broker did not respond, trying to reconnect\n");
-                    cliState = CliState.UNREG;
-                    callback.disconnected(broker);
-                    sublistInactivateAll();
-                    Thread.currentThread().interrupt();
-                }
-            }
-        }
     }
 }
